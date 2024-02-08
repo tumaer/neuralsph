@@ -1,4 +1,4 @@
-# Neural SPH: Improved Neural Modeling of Langrangian Fluid Dynamics
+# Neural SPH: Improved Neural Modeling of Lagrangian Fluid Dynamics
 
 We note that much of the code we provide is an adapted version of the code available on https://github.com/tumaer/lagrangebench. Our core functions are the following two:
 - `relax_wrapper` in `neural_sph/rollout.py` - core relaxation algorithm
