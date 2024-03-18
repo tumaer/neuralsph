@@ -3,3 +3,4 @@ rlt/
 datasets/
 venv*/
 .DS_Store
+*.pdf
