@@ -2,16 +2,14 @@ import json
 import os
 import os.path as osp
 import pickle
+from typing import List, Union, Optional
 
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-from jax import vmap, lax, jit
+from jax import vmap, lax, jit, tree_util
 from jax_md.partition import space
-try:
-    from lagrangebench.evaluate.utils import write_vtk
-except:
-    from lagrangebench.utils import write_vtk
+from lagrangebench.evaluate.utils import write_vtk
 
 from neural_sph.utils import case_setup_redist, rho_computer
 
@@ -26,64 +24,111 @@ def average_trajs(dir):
     assert len(files) == 1, "only one metrics file should be present"
     metrics = pickle.load(open(os.path.join(dir, files[0]), "rb"))
 
-    dict_out = {"mse": [], "sinkhorn": [], "e_kin": []}
+    keys = ["mse", "e_kin", "sinkhorn", "rho_mae", "dirichlet", "chamfer"]
+    dict_out = {key: [] for key in keys}
     for _, value in metrics.items():
-        dict_out["mse"].append(value["mse"])
-        dict_out["sinkhorn"].append(value["sinkhorn"])
         dict_out["e_kin"].append(
             (value["e_kin"]["target"] - value["e_kin"]["predicted"]) ** 2
         )
+        for key in keys:
+            if key != "e_kin":
+                dict_out[key].append(value[key])
 
     for key, v in dict_out.items():
         dict_out[key] = np.array(v)
 
     for key, v in dict_out.items():
-        dict_out[key] = {"mean": np.mean(v, axis=0), "std": np.std(v, axis=0)}
+        dict_out[key] = {
+            "mean": np.mean(v, axis=0),
+            "std": np.std(v, axis=0),
+            "min": np.min(v, axis=0),
+            "q25": np.quantile(v, 0.25, axis=0),
+            "q75": np.quantile(v, 0.75, axis=0),
+            "max": np.max(v, axis=0),
+        }
     return dict_out
 
 
 def plot_stats(
-    dirs,
-    rlt_dir,
-    labels=None,
+    dirs: Union[List[str], str],
+    rlt_dir: Union[List[str], str],
+    labels: Optional[Union[List[str], str]] = None,
     log=True,
     limits=[None, None, None],
     limits_lower=[2e-7, 2e-5, 1e-8],
+    save_name=None,
+    c_order=None,
 ):
     """Plot the evolution of metrics averaged over all available rollouts.
 
     Relies on the structure `{rlt_dir}/test{str(dir)}/metrics_{...}.pkl`.
     """
+    if isinstance(rlt_dir, list):
+        save_dir = rlt_dir[0]
+        assert isinstance(dirs[0], list) and (len(dirs) == len(rlt_dir))
+        assert (labels is None) or isinstance(labels[0], list)
+        assert (labels is None) or (len(labels) == len(rlt_dir))
+    else:
+        save_dir = rlt_dir
+        labels = [labels]
+        rlt_dir = [rlt_dir]
 
     c = ["k", "r", "g", "b", "c", "m", "y", "orange", "brown", "pink", "silver"]
+    if c_order is not None:
+        c = [c[i] for i in c_order]
+    line_styles = ["-", "--", "-.", ":", "-"]
 
     # plot first row mean values, second row std values
-    fig, axs = plt.subplots(2, 3, figsize=(15, 8))
+    fig, axs = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
 
-    for i, d in enumerate(dirs):
-        dict_out = average_trajs(os.path.join(rlt_dir, "test" + str(d)))
-        len_mse = len(dict_out["mse"]["mean"])
+    for j, rlt_dir_i in enumerate(rlt_dir):
+        labels_i = labels[j] if labels is not None else None
+        dirs_i = dirs[j] if isinstance(dirs[0], list) else dirs
+        ls = line_styles[j]
+        for i, d in enumerate(dirs_i):
+            dict_out = average_trajs(os.path.join(rlt_dir_i, "test" + str(d)))
+            len_mse = len(dict_out["mse"]["mean"])
 
-        stride_sinkhorn = np.round(len_mse / len(dict_out["sinkhorn"]["mean"])).astype(
-            int
-        )
-        stride_e_kin = np.round(len_mse / len(dict_out["e_kin"]["mean"])).astype(int)
-        x_mse = np.arange(len_mse)
-        x_sinkhorn = np.arange(0, len_mse, stride_sinkhorn)
-        x_e_kin = np.arange(0, len_mse - 1, stride_e_kin)
+            stride_sinkhorn = np.round(
+                len_mse / len(dict_out["sinkhorn"]["mean"])
+            ).astype(int)
+            stride_e_kin = np.round(len_mse / len(dict_out["e_kin"]["mean"])).astype(
+                int
+            )
+            x_mse = np.arange(len_mse)
+            x_sinkhorn = np.arange(0, len_mse, stride_sinkhorn)
+            x_e_kin = np.arange(0, len_mse - 1, stride_e_kin)
 
-        label = labels[i] if labels is not None else d
-        axs[0, 0].plot(x_mse, dict_out["mse"]["mean"] + EPS, label=label, c=c[i])
-        axs[0, 2].plot(x_sinkhorn, dict_out["sinkhorn"]["mean"] + EPS, c=c[i])
-        axs[0, 1].plot(x_e_kin, dict_out["e_kin"]["mean"] + EPS, c=c[i])
+            label = labels_i[i] if labels_i is not None else d
 
-        axs[1, 0].plot(x_mse, dict_out["mse"]["std"] + EPS, c=c[i])
-        axs[1, 2].plot(x_sinkhorn, dict_out["sinkhorn"]["std"] + EPS, c=c[i])
-        axs[1, 1].plot(x_e_kin, dict_out["e_kin"]["std"] + EPS, c=c[i])
-
-    axs[0, 0].set_title("MSE_p")
-    axs[0, 1].set_title("MSE_Ekin")
-    axs[0, 2].set_title("Sinkhorn")
+            keys = ["mse", "e_kin", "sinkhorn", "rho_mae", "dirichlet", "chamfer"]
+            titles = [
+                r"MSE$_{400}$",
+                r"MSE$_{Ekin}$",
+                "Sinkhorn",
+                r"MAE$_{\rho}$",
+                "Dirichlet",
+                "Chamfer",
+            ]
+            x_axes = [x_mse, x_e_kin, x_sinkhorn, x_sinkhorn, x_sinkhorn, x_mse]
+            for ax, key, x_axis in zip(axs.flatten(), keys, x_axes):
+                x_axis = x_axis[: len(dict_out[key]["mean"])]
+                # specify the line type: solid or dashed
+                ax.plot(
+                    x_axis,
+                    dict_out[key]["mean"] + EPS,
+                    ls,
+                    label=label,
+                    c=c[i],
+                )
+                ax.fill_between(
+                    x_axis,
+                    dict_out[key]["q25"] + EPS,
+                    dict_out[key]["q75"],
+                    linestyle=ls,
+                    alpha=0.2,
+                    color=c[i],
+                )
 
     for i, limit in enumerate(limits):
         if log:
@@ -93,12 +138,20 @@ def plot_stats(
             axs[0, i].set_ylim([limits_lower[i], limit])
             axs[1, i].set_ylim([limits_lower[i], limit])
 
-    for ax in axs.flatten():
+    # for ax in axs[0]:  # not needed when sharex=True
+    #     ax.set_xticklabels([])
+    for ax in axs[1]:
         ax.set_xlabel("step")
+    for ax, title in zip(axs.flatten(), titles):
+        ax.set_title(title)
         ax.grid()
 
     axs[0, 0].legend(loc="lower right")
     plt.tight_layout()
+
+    if save_name is not None:
+        save_path = f"{save_dir}/{save_dir.split('/')[-1]}_{save_name}.pdf"
+        plt.savefig(save_path)
 
 
 def plot_scatter(
@@ -130,6 +183,7 @@ def plot_scatter(
 
     if save_name is not None:
         plt.savefig(save_name)
+    plt.close()
 
 
 def plot_hist(
@@ -331,7 +385,7 @@ def plot_hist(
             axs[i, 1].legend(loc="upper right")
     else:
         axs[0, 0].legend(loc="upper left")
-    
+
     if xlims is not None:
         for i in range(len(time_steps)):
             axs[i, 0].set_xlim(xlims[0])
@@ -346,7 +400,7 @@ def plot_hist(
         ax.grid()
 
     plt.tight_layout()
-    
+
     if save_name is not None:
         plt.savefig(save_name)
 
@@ -405,10 +459,12 @@ def pkl2vtk(src_path, dst_path=None, metadata_root=None):
 
         ### Compute density
         comp_rho = rho_computer(metadata_root)
+
         @jit
         def body(_, r):
             rho = comp_rho(r, rollout["particle_type"])
             return None, rho
+
         _, _rho = lax.scan(body, None, rollout["predicted_rollout"])
         _, _rho_ref = lax.scan(body, None, rollout["ground_truth_rollout"])
 
@@ -434,3 +490,154 @@ def pkl2vtk(src_path, dst_path=None, metadata_root=None):
             state_vtk["a"] = _acc_ref[k]
             state_vtk["rho"] = _rho_ref[k]
         write_vtk(state_vtk, f"{file_prefix}_ref_{k}.vtk")
+
+
+def preprocess_grid_search(rlt_dir, dirs):
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    keys = ["mse", "e_kin", "sinkhorn", "rho_mae", "dirichlet", "chamfer"]
+    titles = [
+        r"MSE$_{400}$",
+        r"MSE$_{Ekin}$",
+        "Sinkhorn",
+        r"MAE$_{\rho}$",
+        "Dirichlet",
+        "Chamfer",
+    ]
+
+    # Structure: {dir: {metric: {mean/std/min/q25/q75/max: value}}}
+    dict_ave = {k: {} for k in dirs}
+    for i, d in enumerate(dirs):
+        dict_ave[d] = average_trajs(os.path.join(rlt_dir, "test" + str(d)))
+    # average the properties over the temporal dimension
+    dict_ave = tree_util.tree_map(lambda x: np.mean(x), dict_ave)
+
+    # Convert to {metric: {mean/std/q25/q75: [value_per_directory, ...]}}
+    dict_out = {
+        k: {"mean": [], "std": [], "q25": [], "q75": []} for k in dict_ave[dirs[0]]
+    }
+    for d in dirs:
+        for k in dict_ave[d]:
+            for m in dict_out[k]:
+                dict_out[k][m].append(dict_ave[d][k][m] + EPS)
+    return dict_out, keys, colors, titles
+
+
+def plot_grid_search(
+    rlt_dir: Union[List[str], str],
+    dirs: Union[List[str], str],
+    x_axis: Union[List[List[float]], List[float]],
+    x_label,
+    x_ticklabels=None,
+    log=[False, False],
+    rotate_x_ticks=False,
+    save_name=None,
+    labels=None,
+):
+    if isinstance(rlt_dir, list):
+        save_dir = rlt_dir[0]
+        assert isinstance(dirs[0], list) and (len(dirs) == len(rlt_dir))
+        assert (len(x_axis) == len(rlt_dir)) and (len(x_axis[0]) == len(dirs[0]))
+        assert (len(labels) == len(rlt_dir)) or (labels is None)
+    else:
+        save_dir = rlt_dir
+        rlt_dir = [rlt_dir]
+        dirs = [dirs]
+        x_axis = [x_axis]
+
+    line_styles = ["-", "--", "-.", ":", "-"]
+
+    fig, axs = plt.subplots(2, 3, figsize=(15, 8))
+    for j, (rlt_dir_j, dirs_j) in enumerate(zip(rlt_dir, dirs)):
+        dict_out, keys, colors, titles = preprocess_grid_search(rlt_dir_j, dirs_j)
+        ls = line_styles[j]
+        c = colors[j]
+        x_axis_j = x_axis[j]
+        assert len(dirs_j) == len(x_axis_j)
+        label = labels[j] if labels is not None else None
+
+        # Plot
+        for i, (ax, k) in enumerate(zip(axs.flatten(), keys)):
+            # print("Debug: ", dict_out[k]["mean"], x_axis, dict_out[k]["min"])
+            ax.plot(x_axis_j, dict_out[k]["mean"], ls, label=label, color=c)
+            ax.fill_between(
+                x_axis_j,
+                dict_out[k]["q25"],
+                dict_out[k]["q75"],
+                alpha=0.2,
+                color=c,
+                linestyle=ls,
+            )
+            ax.set_title(titles[i])
+            # ax.legend()
+
+    for ax in axs[1]:
+        ax.set_xlabel(x_label)
+    for ax in axs.flatten():
+        if log[0]:
+            ax.set_xscale("log")
+        if log[1]:
+            ax.set_yscale("log")
+        # set the x-axis ticks, labels, and grid lines to the values in x_axis
+        ax.set_xticks([])
+        ax.set_xticks(x_axis[0])
+        ax.set_xlim([min(x_axis[0]), max(x_axis[0])])
+
+    for ax in axs[1]:
+        if x_ticklabels is not None:
+            ax.set_xticklabels(x_ticklabels)
+        else:
+            ax.set_xticklabels(x_axis[0])
+        if rotate_x_ticks:
+            ax.tick_params(axis="x", rotation=45)
+    for ax in axs[0]:
+        ax.set_xticklabels([])
+
+    for ax in axs.flatten():
+        ax.grid()
+
+    if labels is not None:
+        axs[0, 0].legend(loc="upper right")
+
+    plt.tight_layout()
+
+    if save_name is not None:
+        save_path = f"{save_dir}/{save_dir.split('/')[-1]}_{save_name}.pdf"
+        plt.savefig(save_path)
+
+
+def plot_grid_search_bars(
+    rlt_dir,
+    dirs,
+    labels,
+    rotate_x_ticks=False,
+    save_name=None,
+    width=0.5,
+    log=True,
+    lims=[None, None, None, None, None, None],
+):
+    assert len(dirs) == len(labels)
+    dict_out, keys, colors, titles = preprocess_grid_search(rlt_dir, dirs)
+
+    # Plot
+    fig, axs = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
+    j = 0
+    for i, (ax, k) in enumerate(zip(axs.flatten(), keys)):
+        c = colors[j]
+        err = [dict_out[k]["q25"], dict_out[k]["q75"]]
+        ax.bar(labels, dict_out[k]["mean"], yerr=err, color=c, alpha=0.5, width=width)
+        ax.set_title(titles[i])
+
+    for i, ax in enumerate(axs.flatten()):
+        ax.grid()
+        if log:
+            ax.set_yscale("log")
+        if lims[i] is not None:
+            ax.set_ylim(None, lims[i])
+        if rotate_x_ticks:
+            ax.tick_params(axis="x", rotation=rotate_x_ticks)
+
+    plt.tight_layout()
+
+    if save_name is not None:
+        save_path = f"{rlt_dir}/{rlt_dir.split('/')[-1]}_{save_name}.pdf"
+        plt.savefig(save_path)

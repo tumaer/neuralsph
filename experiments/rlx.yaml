@@ -1,0 +1,29 @@
+extends: NEURALSPH_DEFAULTS
+
+dataset_path: datasets/2D_LDC_2708_10kevery100
+
+model: 
+  name: gns
+  relaxed: true
+  num_mp_steps: 10
+  latent_dim: 128
+
+train:
+  noise_std: 0.001
+  optimizer:
+    lr_start: 5.e-4
+
+logging:
+  wandb: true
+  wandb_entity: segnn-sph
+  wandb_project: ldc_2d_rlx
+  ckp_dir: ckp/rlx_ldc2d
+
+neighbors:
+  multiplier: 2.0
+
+r:
+  variant_p: None
+  variant_visc: None
+  loops: 1
+  acc: 0.03

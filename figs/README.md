@@ -1,0 +1,1 @@
+> Note: Some of the figures from the paper are based on the [original code](https://github.com/tumaer/neuralsph/tree/4b1ca0d102a1ae0909a3c826ae2d0276bf2affa4) on Github. However, the codebase changed significantly during the rebuttal, and we include the bash scripts to generate the data for the figures in `figs/`.

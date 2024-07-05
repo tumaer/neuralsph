@@ -1,0 +1,9 @@
+[tool.poetry]
+name = "neural-sph"
+version = "0.0.1"
+description = "Neural SPH"
+authors = ["Artur Toshev <artur.toshev@tum.de>"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

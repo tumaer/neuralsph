@@ -1,0 +1,25 @@
+default_language_version:
+  python: python3
+exclude: |
+  (?x)^(
+      venv/|
+      ckp/|
+      rlt/|
+  )$
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=20000']
+      - id: check-docstring-first
+      - id: check-toml
+      - id: check-yaml
+      - id: requirements-txt-fixer
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: 'v0.3.4'
+    hooks:
+      - id: ruff
+        args: [ --fix ]
+      - id: ruff-format

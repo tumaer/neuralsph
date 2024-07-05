@@ -1,4 +1,5 @@
 import json
+import os
 import os.path as osp
 import pickle
 import pprint
@@ -9,6 +10,9 @@ import numpy as np
 from jax import grad, jit, ops, vmap
 from jax_md import space
 from lagrangebench.case_setup.partition import neighbor_list
+from lagrangebench.evaluate import averaged_metrics
+
+EPS = jnp.finfo(float).eps
 
 
 def case_setup_redist(metadata_root, rc_factor=None, is_physical=False, verbose=True):
@@ -165,6 +169,7 @@ def pos_init_cartesian_2d(box_size, dx):
     r = (jnp.vstack(list(map(jnp.ravel, grid))).T + 0.5) * dx
     return r
 
+
 def pos_init_cartesian_3d(box_size, dx):
     n = np.array((box_size / dx).round(), dtype=int)
     grid = np.meshgrid(range(n[0]), range(n[1]), range(n[2]), indexing="xy")
@@ -172,7 +177,9 @@ def pos_init_cartesian_3d(box_size, dx):
     return r
 
 
-def rho_computer(dataset_path, rlt_dir=None, input_seq_len=6, verbose=True):
+def rho_computer(
+    dataset_path, rlt_dir=None, input_seq_len=6, verbose=True, is_drhodr=False
+):
     """Compute density from coordinates or from a rollout file.
 
     Args:
@@ -194,6 +201,12 @@ def rho_computer(dataset_path, rlt_dir=None, input_seq_len=6, verbose=True):
     bounds = np.array(metadata["bounds"])
     mass = state["mass"]
 
+    def density_grad(r_ij, d_ij, mass_j):
+        """Compute the density gradient."""
+        e_ij = r_ij / (d_ij + EPS)
+        drhodr = mass_j * kernel_fn.grad_w(d_ij) * e_ij
+        return drhodr
+
     def comp_rho(r, mask_fluid):
         nbrs = nbrs_update(r, num_particles=N)
         i_s, j_s = nbrs.idx
@@ -205,7 +218,13 @@ def rho_computer(dataset_path, rlt_dir=None, input_seq_len=6, verbose=True):
         rho = mass * ops.segment_sum(w_dist, i_s, N)  # density summation
         rho = jnp.where(rho < 0.98, 1, rho)  # detect free surface
         rho = jnp.where(mask_fluid, rho, 1.0)  # give walls the reference quantity
-        return rho
+
+        if is_drhodr:
+            drhodr_ij = vmap(density_grad)(dr_i_j, dist, mass[j_s])
+            drhodr = ops.segment_sum(drhodr_ij, i_s, N)
+            return rho, drhodr
+        else:
+            return rho
 
     def rho_from_pkl(dir, step_idx, rlt_idx=0):
         """Compute density from a rollout file."""
@@ -226,3 +245,17 @@ def rho_computer(dataset_path, rlt_dir=None, input_seq_len=6, verbose=True):
         return comp_rho(jnp.array(r, dtype=jnp.float64), tag == 0)
 
     return rho_from_pkl if rlt_dir is not None else rho_from_r
+
+
+def get_metrics_ave(rlt_dir, test_i, keys=None):
+    dir = f"{rlt_dir}/test{test_i}"
+    files = os.listdir(dir)
+    files = [f for f in files if ("metrics" in f and ".pkl" in f)]
+    assert len(files) == 1, "only one metrics file should be present"
+    metrics = pickle.load(open(os.path.join(dir, files[0]), "rb"))
+
+    metrics_ave = averaged_metrics(metrics)
+
+    if keys is not None:
+        metrics_ave = {k: metrics_ave[k] for k in keys}
+    return metrics_ave

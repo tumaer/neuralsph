@@ -4,7 +4,7 @@ import os
 import pickle
 import time
 from functools import partial
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple, Union
 
 import haiku as hk
 import jax
@@ -14,12 +14,8 @@ from jax import jit, ops, vmap
 from jax_md import space
 from lagrangebench.data import H5Dataset
 from lagrangebench.data.utils import numpy_collate
-from lagrangebench.defaults import defaults
-from lagrangebench.evaluate.metrics import MetricsComputer, MetricsDict
-try:
-    from lagrangebench.evaluate.utils import write_vtk
-except:
-    from lagrangebench.utils import write_vtk
+from lagrangebench.evaluate.metrics import MetricsDict
+from lagrangebench.evaluate.utils import write_vtk
 from lagrangebench.utils import (
     broadcast_from_batch,
     broadcast_to_batch,
@@ -27,9 +23,14 @@ from lagrangebench.utils import (
     load_haiku,
     set_seed,
 )
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from neural_sph.utils import case_setup_redist, rho_computer
+from neural_sph.defaults import defaults
+from neural_sph.visualization import plot_scatter
+from neural_sph.metrics import NeuralSPHMetricsComputer
+
 
 EPS = jnp.finfo(float).eps
 
@@ -75,7 +76,7 @@ def relax_wrapper(dataset_path, params):
         p = vmap(eos.p_fn)(rho)
         background_pressure_tvf = vmap(eos.p_fn)(jnp.zeros_like(rho))
 
-        # velocity needed for viscous term and for Riemann pressure term
+        # velocity needed for viscous term
         u = vmap(displacement_fn)(r, r_prev)
         # nondimensionalize u with u_ref
         u /= u_ref
@@ -84,7 +85,6 @@ def relax_wrapper(dataset_path, params):
         if metadata["is_bc_trick"]:
             # require operations with sender fluid and receiver wall/lid
             mask_j_s_fluid = jnp.where(tag[j_s] == 0, 1.0, 0.0)
-            # mask_j_s_wall = jnp.where(tag[j_s] > 0, 1.0, 0.0)
             w_j_s_fluid = w_dist * mask_j_s_fluid
             # sheparding denominator
             w_i_sum_wf = ops.segment_sum(w_j_s_fluid, i_s, N)
@@ -135,7 +135,7 @@ def relax_wrapper(dataset_path, params):
                 acc = -prefactor * p_ij * kernel_grad
 
             else:
-                raise NotImplementedError("Supported variant_p: standard, riemann")
+                raise NotImplementedError("Supported variant_p: standard")
 
             if params["visc"] != 0:
                 u_ij = u_i - u_j
@@ -242,7 +242,7 @@ def _forward_eval(
     next_position = case_integrate(pred, current_positions)
 
     # redistribution
-    if variant in ["standard", "riemann"]:
+    if variant in ["standard"]:
         next_position = redist(next_position, current_positions[:, -1], particle_type)
 
     # update only the positions of non-boundary particles
@@ -340,6 +340,7 @@ def eval_batched_rollout(
         is_time = False
         if is_time:
             import time
+
             current_positions_batch, state_batch = forward_eval_vmap(
                 params,
                 state,
@@ -390,7 +391,7 @@ def eval_batched_rollout(
 def eval_rollout(
     model_apply: Callable,
     case,
-    metrics_computer: MetricsComputer,
+    metrics_computer: NeuralSPHMetricsComputer,
     params: hk.Params,
     state: hk.State,
     neighbors: partition.NeighborList,
@@ -398,9 +399,10 @@ def eval_rollout(
     n_rollout_steps: int,
     n_trajs: int,
     rollout_dir: str,
+    params_redist: DictConfig,
     out_type: str = "none",
     n_extrap_steps: int = 0,
-    params_redist: dict = {},
+    comp_rho: Callable = None,
 ) -> MetricsDict:
     """Compute the rollout and evaluate the metrics.
 
@@ -428,7 +430,7 @@ def eval_rollout(
     if rollout_dir is not None:
         os.makedirs(rollout_dir, exist_ok=True)
 
-    if params_redist["variant_p"] in ["standard", "riemann"]:
+    if params_redist["variant_p"] in ["standard"]:
         redist_wrapper = REDIST["wrapper"]
     else:
         redist_wrapper = REDIST[params_redist["variant_p"]]
@@ -445,8 +447,6 @@ def eval_rollout(
     forward_eval_vmap = vmap(forward_eval, in_axes=(None, None, 0, 0, 0))
     preprocess_eval_vmap = vmap(case.preprocess_eval, in_axes=(0, 0))
     metrics_computer_vmap = vmap(metrics_computer, in_axes=(0, 0))
-
-    comp_rho = rho_computer(dataset_path)
 
     for i, traj_batch_i in enumerate(loader_eval):
         # if n_trajs is not a multiple of batch_size, we slice from the last batch
@@ -473,6 +473,30 @@ def eval_rollout(
             n_extrap_steps=n_extrap_steps,
         )
 
+        # utility to plot the last frame of a rollout
+        bounds = loader_eval.dataset.metadata["bounds"]
+        bounds = [bounds[0][1], bounds[1][1]]
+        for suffix in ["", "_ref"]:
+            if suffix == "_ref":
+                # frame from reference simulation
+                pos_input_batch = traj_batch_i[0].transpose(0, 2, 1, 3)
+                r = pos_input_batch[0, t_window + n_rollout_steps - 1]
+            else:
+                r = example_rollout_batch[0, -1]
+
+            rho, _ = comp_rho(r, traj_batch_i[1][0])
+            plot_scatter(
+                r,
+                bounds=loader_eval.dataset.metadata["bounds"],
+                color=rho,
+                mask=None,
+                figsize=(5 * bounds[0] / bounds[1] + 1.5, 5),
+                size=1,
+                save_name=os.path.join(rollout_dir, f"rollout_{i}{suffix}.png"),
+                vmin=0.98,
+                vmax=1.15,
+            )
+
         current_batch_size = traj_batch_i[0].shape[0]
         for j in range(current_batch_size):
             # write metrics to output dictionary
@@ -490,27 +514,28 @@ def eval_rollout(
                 initial_positions = pos_input[:t_window]
                 example_full = jnp.concatenate([initial_positions, example_rollout])
                 example_rollout = {
-                    "predicted_rollout": example_full,  # (t, nodes, dim)
+                    "predicted_rollout": example_full,  # (t + extrap, nodes, dim)
                     "ground_truth_rollout": pos_input,  # (t, nodes, dim),
                     "particle_type": traj_batch_i[1][j],  # (nodes,)
                 }
 
                 file_prefix = os.path.join(rollout_dir, f"rollout_{i*batch_size+j}")
                 if out_type == "vtk":  # write vtk files for each time step
-                    for k in range(pos_input.shape[0]):
+                    for k in range(example_full.shape[0]):
                         # predictions
                         state_vtk = {
                             "r": example_rollout["predicted_rollout"][k],
                             "tag": example_rollout["particle_type"],
                         }
                         write_vtk(state_vtk, f"{file_prefix}_{k}.vtk")
+                    for k in range(pos_input.shape[0]):
                         # ground truth reference
-                        state_vtk = {
+                        ref_state_vtk = {
                             "r": example_rollout["ground_truth_rollout"][k],
                             "tag": example_rollout["particle_type"],
                         }
-                        write_vtk(state_vtk, f"{file_prefix}_ref_{k}.vtk")
-                if out_type == "pkl":
+                        write_vtk(ref_state_vtk, f"{file_prefix}_ref_{k}.vtk")
+                elif out_type == "pkl":
                     filename = f"{file_prefix}.pkl"
 
                     with open(filename, "wb") as f:
@@ -532,19 +557,14 @@ def infer(
     model: hk.TransformedWithState,
     case,
     data_test: H5Dataset,
+    load_ckp: Optional[str],
+    cfg_eval_infer: Union[Dict, DictConfig],
+    rollout_dir: Optional[str],
+    n_rollout_steps: int,
+    seed: int,
+    params_redist: DictConfig,
     params: Optional[hk.Params] = None,
     state: Optional[hk.State] = None,
-    load_checkpoint: Optional[str] = None,
-    metrics: List = ["mse"],
-    rollout_dir: Optional[str] = None,
-    eval_n_trajs: int = defaults.eval_n_trajs,
-    n_rollout_steps: int = defaults.n_rollout_steps,
-    out_type: str = defaults.out_type,
-    n_extrap_steps: int = defaults.n_extrap_steps,
-    seed: int = defaults.seed,
-    metrics_stride: int = defaults.metrics_stride,
-    batch_size: int = 2,
-    params_redist: dict = {},
 ):
     """
     Infer on a dataset, compute metrics and optionally save rollout in out_type format.
@@ -555,43 +575,51 @@ def infer(
         data_test: Test dataset.
         params: Haiku params.
         state: Haiku state.
-        load_checkpoint: Path to checkpoint directory.
-        metrics: Metrics to compute.
+        load_ckp: Path to checkpoint directory.
+        cfg_eval_infer: Evaluation configuration for inference mode.
         rollout_dir: Path to rollout directory.
-        eval_n_trajs: Number of trajectories to evaluate.
         n_rollout_steps: Number of rollout steps.
-        out_type: Output type. Either "none", "vtk" or "pkl".
-        n_extrap_steps: Number of extrapolation steps.
         seed: Seed.
 
     Returns:
         eval_metrics: Metrics per trajectory.
     """
     assert (
-        params is not None or load_checkpoint is not None
-    ), "Either params or a load_checkpoint directory must be provided for inference."
+        params is not None or load_ckp is not None
+    ), "Either params or a load_ckp directory must be provided for inference."
+
+    if isinstance(cfg_eval_infer, Dict):
+        cfg_eval_infer = OmegaConf.create(cfg_eval_infer)
+    # if one of the cfg_* arguments has a subset of the default configs, merge them
+    cfg_eval_infer = OmegaConf.merge(defaults.eval.infer, cfg_eval_infer)
+    n_trajs = cfg_eval_infer.n_trajs
+    if n_trajs == -1:
+        n_trajs = data_test.num_samples
 
     if params is not None:
         if state is None:
             state = {}
     else:
-        params, state, _, _ = load_haiku(load_checkpoint)
+        params, state, _, _ = load_haiku(load_ckp)
 
     key, seed_worker, generator = set_seed(seed)
 
+    comp_rho = rho_computer(data_test.dataset_path, is_drhodr=True)
+
     loader_test = DataLoader(
         dataset=data_test,
-        batch_size=batch_size,
+        batch_size=cfg_eval_infer.batch_size,
         collate_fn=numpy_collate,
         worker_init_fn=seed_worker,
         generator=generator,
     )
-    metrics_computer = MetricsComputer(
-        metrics,
+    metrics_computer = NeuralSPHMetricsComputer(
+        cfg_eval_infer.metrics,
         dist_fn=case.displacement,
         metadata=data_test.metadata,
         input_seq_length=data_test.input_seq_length,
-        stride=metrics_stride,
+        stride=cfg_eval_infer.metrics_stride,
+        comp_rho=comp_rho,
     )
     # Precompile model
     model_apply = jit(model.apply)
@@ -610,10 +638,11 @@ def infer(
         neighbors=neighbors,
         loader_eval=loader_test,
         n_rollout_steps=n_rollout_steps,
-        n_trajs=eval_n_trajs,
+        n_trajs=n_trajs,
         rollout_dir=rollout_dir,
-        out_type=out_type,
-        n_extrap_steps=n_extrap_steps,
+        out_type=cfg_eval_infer.out_type,
+        n_extrap_steps=cfg_eval_infer.n_extrap_steps,
         params_redist=params_redist,
+        comp_rho=comp_rho,
     )
     return eval_metrics
