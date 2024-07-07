@@ -4,5 +4,7 @@ datasets/
 venv*/
 .DS_Store
 *.pdf
+figs/*.mp4
+figs/*.png
 *.out
 __pycache__/
