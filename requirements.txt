@@ -3,3 +3,7 @@
 gdown
 lagrangebench==0.2.0a1
 pre-commit
+
+# needed constraints as of 2025-11-22:
+dm-haiku==0.0.12
+scipy==1.12.0

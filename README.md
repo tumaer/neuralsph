@@ -13,8 +13,9 @@ source venv/bin/activate
 pip install -r requirements.txt  # install dependencies
 pip install -e .  # install neuralsph as a package
 
-# on a cuda12 machine run this line in addition:
-# pip install --upgrade jax[cuda12_pip]==0.4.20 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+# on a cuda12 machine run these lines in addition:
+pip install --upgrade jax[cuda12_pip]==0.4.20 -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+pip install nvidia-cudnn-cu12==8.9.7.29 # jax 0.4.20 doesn't automatically load the right cudnn version - https://github.com/jax-ml/jax/issues/18027
 ```
 
 ## Usage
@@ -29,15 +30,17 @@ Run `bash download_data.sh all datasets/` to download all datasets from Lagrange
 We show how to obtain the numbers we get on a rollout with our SPH relaxation on the example of a 2D LDC checkpoint stored in `CKP_DIR=ckp/pretrained/gns_ldc2d/best`:
 
 ```bash
+export CKP_DIR=ckp/pretrained/gns_ldc2d/best
+
 # baseline without relaxation
-python main.py eval.test=True load_ckp=$CKP_DIR eval.infer.n_trajs=-1 \
-    eval.infer.metrics_stride=10 eval.n_rollout_steps=400 \
-    r.variant_p=None
+python main.py gpu=0 mode=infer eval.test=True load_ckp=$CKP_DIR eval.infer.n_trajs=-1 \
+    eval.infer.metrics_stride=10 eval.n_rollout_steps=400 eval.infer.batch_size=4 \
+    r.variant_p=None eval.rollout_dir=rlt/ldc2d_gns/test_0
 
 # rollout including 5-step relaxation with $\alpha=0.03$
-python main.py eval.test=True load_ckp=$CKP_DIR eval.infer.n_trajs=-1 \
-    eval.infer.metrics_stride=10 eval.n_rollout_steps=400 \
-    r.loops=5 r.acc=0.03
+python main.py gpu=0 mode=infer eval.test=True load_ckp=$CKP_DIR eval.infer.n_trajs=-1 \
+    eval.infer.metrics_stride=10 eval.n_rollout_steps=400 eval.infer.batch_size=4 \
+    r.loops=5 r.acc=0.03 eval.rollout_dir=rlt/ldc2d_gns/test_5_003
 ```
 
 ## RPF Force Smoothing
